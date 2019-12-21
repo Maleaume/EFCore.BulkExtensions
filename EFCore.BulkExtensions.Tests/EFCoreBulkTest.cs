@@ -1,10 +1,11 @@
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.Extensions.Caching.Memory;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.Extensions.Caching.Memory;
 using Xunit;
 
 namespace EFCore.BulkExtensions.Tests
@@ -18,19 +19,26 @@ namespace EFCore.BulkExtensions.Tests
         private static Func<TestContext, IEnumerable<Item>> AllItemsQuery = EF.CompileQuery<TestContext, IEnumerable<Item>>(ctx => ctx.Items.AsNoTracking());
 
         [Theory]
-        [InlineData(true)]
-        //[InlineData(false)] // for speed comparison with Regular EF CUD operations
-        public void OperationsTest(bool isBulkOperation)
+        [InlineData(DbServer.SqlServer, true)]
+        [InlineData(DbServer.Sqlite, true)]
+        //[InlineData(DbServer.SqlServer, false)] // for speed comparison with Regular EF CUD operations
+        public void OperationsTest(DbServer databaseType, bool isBulkOperation)
         {
+            ContextUtil.DbServer = databaseType;
+
             //DeletePreviousDatabase();
+            new EFCoreBatchTest().RunDeleteAll(databaseType);
 
             RunInsert(isBulkOperation);
             RunInsertOrUpdate(isBulkOperation);
-            RunUpdate(isBulkOperation);
-            RunRead(isBulkOperation);
-            RunDelete(isBulkOperation);
+            RunUpdate(isBulkOperation, databaseType);
+            if (databaseType == DbServer.SqlServer)
+            {
+                RunRead(isBulkOperation); // Not Yet supported for Sqlite
+            }
+            RunDelete(isBulkOperation, databaseType);
 
-            CheckQueryCache();
+            //CheckQueryCache();
         }
 
         private void DeletePreviousDatabase()
@@ -62,11 +70,11 @@ namespace EFCore.BulkExtensions.Tests
             {
                 var entities = new List<Item>();
                 var subEntities = new List<ItemHistory>();
-                for (int i = 1; i < EntitiesNumber; i++)
+                for (int i = 1, j = -(EntitiesNumber - 1); i < EntitiesNumber; i++, j++)
                 {
                     var entity = new Item
                     {
-                        ItemId = isBulkOperation ? i : 0,
+                        ItemId = isBulkOperation ? j : 0,
                         Name = "name " + i,
                         Description = "info " + Guid.NewGuid().ToString().Substring(0, 3),
                         Quantity = i % 10,
@@ -93,31 +101,64 @@ namespace EFCore.BulkExtensions.Tests
 
                 if (isBulkOperation)
                 {
-                    using (var transaction = context.Database.BeginTransaction())
+                    if (ContextUtil.DbServer == DbServer.SqlServer)
                     {
-                        context.BulkInsert(
-                            entities,
-                            new BulkConfig
-                            {
-                                PreserveInsertOrder = true,
-                                SetOutputIdentity = true,
-                                BatchSize = 4000,
-                                UseTempDB = true
-                            },
-                            (a) => WriteProgress(a)
-                        );
-
-                        foreach (var entity in entities)
+                        using (var transaction = context.Database.BeginTransaction())
                         {
-                            foreach (var subEntity in entity.ItemHistories)
-                            {
-                                subEntity.ItemId = entity.ItemId; // setting FK to match its linked PK that was generated in DB
-                            }
-                            subEntities.AddRange(entity.ItemHistories);
-                        }
-                        context.BulkInsert(subEntities);
+                            context.BulkInsert(
+                                entities,
+                                new BulkConfig
+                                {
+                                    PreserveInsertOrder = true,
+                                    SetOutputIdentity = true,
+                                    BatchSize = 4000,
+                                    UseTempDB = true
+                                },
+                                (a) => WriteProgress(a)
+                            );
 
-                        transaction.Commit();
+                            foreach (var entity in entities)
+                            {
+                                foreach (var subEntity in entity.ItemHistories)
+                                {
+                                    subEntity.ItemId = entity.ItemId; // setting FK to match its linked PK that was generated in DB
+                                }
+                                subEntities.AddRange(entity.ItemHistories);
+                            }
+                            context.BulkInsert(subEntities);
+
+                            transaction.Commit();
+                        }
+                    }
+                    else if (ContextUtil.DbServer == DbServer.Sqlite)
+                    {
+                        using (var connection = (SqliteConnection)context.Database.GetDbConnection())
+                        {
+                            connection.Open();
+                            using (var transaction = connection.BeginTransaction())
+                            {
+                                var bulkConfig = new BulkConfig()
+                                {
+                                    SqliteConnection = connection,
+                                    SqliteTransaction = transaction,
+                                    SetOutputIdentity = true,
+                                };
+                                context.BulkInsert(entities, bulkConfig);
+
+                                foreach (var entity in entities)
+                                {
+                                    foreach (var subEntity in entity.ItemHistories)
+                                    {
+                                        subEntity.ItemId = entity.ItemId; // setting FK to match its linked PK that was generated in DB
+                                    }
+                                    subEntities.AddRange(entity.ItemHistories);
+                                }
+                                bulkConfig.SetOutputIdentity = false;
+                                context.BulkInsert(subEntities, bulkConfig);
+
+                                transaction.Commit();
+                            }
+                        }
                     }
                 }
                 else
@@ -129,8 +170,11 @@ namespace EFCore.BulkExtensions.Tests
 
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
+                var temp = context.ItemHistories.FirstOrDefault();
+
                 int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber - 1, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -169,8 +213,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = context.Items.Count();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -178,12 +224,12 @@ namespace EFCore.BulkExtensions.Tests
             }
         }
 
-        private void RunUpdate(bool isBulkOperation)
+        private void RunUpdate(bool isBulkOperation, DbServer databaseType)
         {
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
                 int counter = 1;
-                var entities = AllItemsQuery(context).ToList(); // context.Items.AsNoTracking());
+                var entities = context.Items.AsNoTracking().ToList();
                 foreach (var entity in entities)
                 {
                     entity.Description = "Desc Update " + counter++;
@@ -196,7 +242,7 @@ namespace EFCore.BulkExtensions.Tests
                         new BulkConfig
                         {
                             PropertiesToInclude = new List<string> { nameof(Item.Description) },
-                            UpdateByProperties = new List<string> { nameof(Item.Name) }
+                            UpdateByProperties = databaseType == DbServer.SqlServer ? new List<string> { nameof(Item.Name) } : null
                         }
                     );
                 }
@@ -208,8 +254,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = context.Items.Count();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -247,7 +295,7 @@ namespace EFCore.BulkExtensions.Tests
             }
         }
 
-        private void RunDelete(bool isBulkOperation)
+        private void RunDelete(bool isBulkOperation, DbServer databaseType)
         {
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
@@ -265,18 +313,26 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = context.Items.Count();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(0, entitiesCount);
                 Assert.Null(lastEntity);
             }
 
+            // Resets AutoIncrement
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                // Resets AutoIncrement
-                context.Database.ExecuteSqlCommand("DBCC CHECKIDENT ('dbo.[" + nameof(Item) + "]', RESEED, 0);"); // can NOT use $"...{nameof(Item)..." because it gets parameterized
-                //context.Database.ExecuteSqlCommand($"TRUNCATE TABLE {nameof(Item)};"); // can NOT work when there is ForeignKey - ItemHistoryId
+                if (databaseType == DbServer.SqlServer)
+                {
+                    context.Database.ExecuteSqlRaw("DBCC CHECKIDENT ('dbo.[" + nameof(Item) + "]', RESEED, 0);"); // can NOT use $"...{nameof(Item)..." because it gets parameterized
+                }
+                else if (databaseType == DbServer.Sqlite)
+                {
+                    context.Database.ExecuteSqlRaw("DELETE FROM sqlite_sequence WHERE name = 'Item';");
+                }
             }
         }
     }

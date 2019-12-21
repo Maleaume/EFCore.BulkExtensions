@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
@@ -9,26 +10,34 @@ namespace EFCore.BulkExtensions.Tests
 {
     public class EFCoreBulkTestAsync
     {
-        protected int EntitiesNumber => 1000;
+        protected int EntitiesNumber => 100000;
 
         private static Func<TestContext, int> ItemsCountQuery = EF.CompileQuery<TestContext, int>(ctx => ctx.Items.Count());
         private static Func<TestContext, Item> LastItemQuery = EF.CompileQuery<TestContext, Item>(ctx => ctx.Items.LastOrDefault());
         private static Func<TestContext, IEnumerable<Item>> AllItemsQuery = EF.CompileQuery<TestContext, IEnumerable<Item>>(ctx => ctx.Items.AsNoTracking());
 
         [Theory]
-        [InlineData(true, false)]
-        //[InlineData(false)] // for speed comparison with Regular EF CUD operations
-        public async Task OperationsTestAsync(bool isBulkOperation, bool insertTo2Tables = false)
+        [InlineData(DbServer.SqlServer, true)]
+        [InlineData(DbServer.Sqlite, true)]
+        //[InlineData(DatabaseType.SqlServer, false)] // for speed comparison with Regular EF CUD operations
+        public async Task OperationsTestAsync(DbServer databaseType, bool isBulkOperation)
         {
+            ContextUtil.DbServer = databaseType;
+
+            await new EFCoreBatchTestAsync().RunDeleteAllAsync(databaseType); // TODO
+
             // Test can be run individually by commenting others and running each separately in order one after another
-            await RunInsertAsync(isBulkOperation, insertTo2Tables);
+            await RunInsertAsync(isBulkOperation);
             await RunInsertOrUpdateAsync(isBulkOperation);
             await RunUpdateAsync(isBulkOperation);
-            await RunReadAsync(isBulkOperation);
-            await RunDeleteAsync(isBulkOperation);
+            if (databaseType == DbServer.SqlServer)
+            {
+                await RunReadAsync(isBulkOperation); // Not Yet supported for Sqlite
+            }
+            await RunDeleteAsync(isBulkOperation, databaseType);
         }
 
-        private async Task RunInsertAsync(bool isBulkOperation, bool insertTo2Tables)
+        private async Task RunInsertAsync(bool isBulkOperation)
         {
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
@@ -36,19 +45,36 @@ namespace EFCore.BulkExtensions.Tests
                 var subEntities = new List<ItemHistory>();
                 for (int i = 1; i < EntitiesNumber; i++)
                 {
-                    entities.Add(new Item
+                    var entity = new Item
                     {
-                        ItemId = i,
+                        ItemId = isBulkOperation ? i : 0,
                         Name = "name " + i,
                         Description = "info " + Guid.NewGuid().ToString().Substring(0, 3),
                         Quantity = i % 10,
                         Price = i / (i % 5 + 1),
                         TimeUpdated = DateTime.Now,
-                    });
+                        ItemHistories = new List<ItemHistory>()
+                    };
+
+                    var subEntity1 = new ItemHistory
+                    {
+                        ItemHistoryId = SeqGuid.Create(),
+                        Remark = $"some more info {i}.1"
+                    };
+                    var subEntity2 = new ItemHistory
+                    {
+                        ItemHistoryId = SeqGuid.Create(),
+                        Remark = $"some more info {i}.2"
+                    };
+                    entity.ItemHistories.Add(subEntity1);
+                    entity.ItemHistories.Add(subEntity2);
+
+                    entities.Add(entity);
                 }
+
                 if (isBulkOperation)
                 {
-                    if (insertTo2Tables)
+                    if (ContextUtil.DbServer == DbServer.SqlServer)
                     {
                         using (var transaction = await context.Database.BeginTransactionAsync())
                         {
@@ -56,21 +82,45 @@ namespace EFCore.BulkExtensions.Tests
 
                             foreach (var entity in entities)
                             {
-                                subEntities.Add(new ItemHistory
+                                foreach (var subEntity in entity.ItemHistories)
                                 {
-                                    ItemHistoryId = SeqGuid.Create(),
-                                    ItemId = entity.ItemId,
-                                    Remark = "some more info"
-                                });
+                                    subEntity.ItemId = entity.ItemId; // setting FK to match its linked PK that was generated in DB
+                                }
+                                subEntities.AddRange(entity.ItemHistories);
                             }
+
                             await context.BulkInsertAsync(subEntities);
 
                             transaction.Commit();
                         }
                     }
-                    else
+                    else if (ContextUtil.DbServer == DbServer.Sqlite)
                     {
-                        await context.BulkInsertAsync(entities);
+                        using (var connection = (SqliteConnection)context.Database.GetDbConnection())
+                        {
+                            connection.Open();
+                            using (var transaction = connection.BeginTransaction())
+                            {
+                                var bulkConfig = new BulkConfig()
+                                {
+                                    SqliteConnection = connection,
+                                    SqliteTransaction = transaction
+                                };
+                                await context.BulkInsertAsync(entities, bulkConfig);
+
+                                foreach (var entity in entities)
+                                {
+                                    foreach (var subEntity in entity.ItemHistories)
+                                    {
+                                        subEntity.ItemId = entity.ItemId; // setting FK to match its linked PK that was generated in DB
+                                    }
+                                    subEntities.AddRange(entity.ItemHistories);
+                                }
+                                await context.BulkInsertAsync(subEntities, bulkConfig);
+
+                                transaction.Commit();
+                            }
+                        }
                     }
                 }
                 else
@@ -81,8 +131,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = await context.Items.CountAsync();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber - 1, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -121,8 +173,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = await context.Items.CountAsync();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -143,7 +197,8 @@ namespace EFCore.BulkExtensions.Tests
                 }
                 if (isBulkOperation)
                 {
-                    await context.BulkUpdateAsync(entities);
+                    var bulkConfig = new BulkConfig() { SetOutputIdentity = true, CalculateStats = true };
+                    await context.BulkUpdateAsync(entities, bulkConfig);
                 }
                 else
                 {
@@ -153,8 +208,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = await context.Items.CountAsync();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(EntitiesNumber, entitiesCount);
                 Assert.NotNull(lastEntity);
@@ -192,7 +249,7 @@ namespace EFCore.BulkExtensions.Tests
             }
         }
 
-        private async Task RunDeleteAsync(bool isBulkOperation)
+        private async Task RunDeleteAsync(bool isBulkOperation, DbServer databaseType)
         {
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
@@ -210,8 +267,10 @@ namespace EFCore.BulkExtensions.Tests
             }
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                int entitiesCount = ItemsCountQuery(context);
-                Item lastEntity = LastItemQuery(context);
+                //int entitiesCount = ItemsCountQuery(context);
+                int entitiesCount = await context.Items.CountAsync();
+                //Item lastEntity = LastItemQuery(context);
+                Item lastEntity = context.Items.OrderByDescending(a => a.ItemId).FirstOrDefault();
 
                 Assert.Equal(0, entitiesCount);
                 Assert.Null(lastEntity);
@@ -219,9 +278,14 @@ namespace EFCore.BulkExtensions.Tests
 
             using (var context = new TestContext(ContextUtil.GetOptions()))
             {
-                // Resets AutoIncrement
-                context.Database.ExecuteSqlCommand("DBCC CHECKIDENT ('dbo.[" + nameof(Item) + "]', RESEED, 0);");
-                //context.Database.ExecuteSqlCommand($"TRUNCATE TABLE {nameof(Item)};"); // can NOT work when there is ForeignKey - ItemHistoryId
+                if (databaseType == DbServer.SqlServer)
+                {
+                    await context.Database.ExecuteSqlRawAsync("DBCC CHECKIDENT('[dbo].[Item]', RESEED, 0);").ConfigureAwait(false);
+                }
+                if (databaseType == DbServer.Sqlite)
+                {
+                    await context.Database.ExecuteSqlRawAsync("DELETE FROM sqlite_sequence WHERE name = 'Item';").ConfigureAwait(false);
+                }
             }
         }
     }

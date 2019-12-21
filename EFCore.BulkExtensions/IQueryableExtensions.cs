@@ -1,40 +1,60 @@
-﻿using System.Linq;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore.Query;
-using Microsoft.EntityFrameworkCore.Query.Internal;
-using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 
 namespace EFCore.BulkExtensions
 {
     public static class IQueryableExtensions
     {
-        private static readonly TypeInfo QueryCompilerTypeInfo = typeof(QueryCompiler).GetTypeInfo();
-
-        private static readonly FieldInfo QueryCompilerField = typeof(EntityQueryProvider).GetTypeInfo().DeclaredFields.First(x => x.Name == "_queryCompiler");
-
-        private static readonly FieldInfo QueryModelGeneratorField = QueryCompilerTypeInfo.DeclaredFields.First(x => x.Name == "_queryModelGenerator");
-
-        private static readonly FieldInfo DataBaseField = QueryCompilerTypeInfo.DeclaredFields.Single(x => x.Name == "_database");
-
-        private static readonly PropertyInfo DatabaseDependenciesField = typeof(Database).GetTypeInfo().DeclaredProperties.Single(x => x.Name == "Dependencies");
-
-        internal static string ToSql<TEntity>(this IQueryable<TEntity> query) where TEntity : class
+        public static string ToSql<TEntity>(this IQueryable<TEntity> query) where TEntity : class
         {
-            var queryCompiler = (QueryCompiler)QueryCompilerField.GetValue(query.Provider);
-            var modelGenerator = (QueryModelGenerator)QueryModelGeneratorField.GetValue(queryCompiler);
-            var queryModel = modelGenerator.ParseQuery(query.Expression);
-            var database = (IDatabase)DataBaseField.GetValue(queryCompiler);
-            var databaseDependencies = (DatabaseDependencies)DatabaseDependenciesField.GetValue(database);
-            var queryCompilationContext = databaseDependencies.QueryCompilationContextFactory.Create(false);
-            var modelVisitor = (RelationalQueryModelVisitor)queryCompilationContext.CreateQueryModelVisitor();
-
-            modelVisitor.CreateQueryExecutor<TEntity>(queryModel);
-            //modelVisitor.CreateAsyncQueryExecutor<TEntity>(queryModel);
-            // CreateAsync not used, throws: Message: System.ArgumentException : Expression of type 'System.Collections.Generic.IEnumerable`1[EFCore.BulkExtensions.Tests.Item]'
-            // cannot be used for return type 'System.Collections.Generic.IAsyncEnumerable`1[EFCore.BulkExtensions.Tests.Item]'
-
-            string sql = modelVisitor.Queries.First().ToString();
+            var (sql, parameters) = ToParametrizedSql(query);
             return sql;
         }
+
+        public static (string, IEnumerable<SqlParameter>) ToParametrizedSql<TEntity>(this IQueryable<TEntity> query) where TEntity : class
+        {
+            string relationalCommandCacheText = "_relationalCommandCache";
+            string selectExpressionText = "_selectExpression";
+            string querySqlGeneratorFactoryText = "_querySqlGeneratorFactory";
+            string relationalQueryContextText = "_relationalQueryContext";
+
+            string cannotGetText = "Cannot get";
+
+            var enumerator = query.Provider.Execute<IEnumerable<TEntity>>(query.Expression).GetEnumerator();
+            var relationalCommandCache = enumerator.Private(relationalCommandCacheText);
+
+
+
+            SelectExpression selectExpression;
+            IQuerySqlGeneratorFactory factory;
+            if (relationalCommandCache != null)
+            {
+                selectExpression = relationalCommandCache.Private<SelectExpression>(selectExpressionText) ?? throw new InvalidOperationException($"{cannotGetText} {selectExpressionText}");
+                factory = relationalCommandCache.Private<IQuerySqlGeneratorFactory>(querySqlGeneratorFactoryText) ?? throw new InvalidOperationException($"{cannotGetText} {querySqlGeneratorFactoryText}");
+            }
+            else
+            {
+                selectExpression = enumerator.Private<SelectExpression>(selectExpressionText) ?? throw new InvalidOperationException($"{cannotGetText} {selectExpressionText}");
+                factory = enumerator.Private<IQuerySqlGeneratorFactory>(querySqlGeneratorFactoryText) ?? throw new InvalidOperationException($"{cannotGetText} {querySqlGeneratorFactoryText}");
+            }
+
+            var sqlGenerator = factory.Create();
+            var command = sqlGenerator.GetCommand(selectExpression);
+
+            var queryContext = enumerator.Private<RelationalQueryContext>(relationalQueryContextText) ?? throw new InvalidOperationException($"{cannotGetText} {relationalQueryContextText}");
+            SqlParameter[] parameters = queryContext.ParameterValues.Select(a => new SqlParameter("@" + a.Key, a.Value)).ToArray();
+
+            string sql = command.CommandText;
+            return (sql, parameters);
+        }
+
+        private static readonly BindingFlags bindingFlags = BindingFlags.Instance | BindingFlags.NonPublic;
+        private static object Private(this object obj, string privateField) => obj?.GetType().GetField(privateField, bindingFlags)?.GetValue(obj);
+        private static T Private<T>(this object obj, string privateField) => (T)obj?.GetType().GetField(privateField, bindingFlags)?.GetValue(obj);
     }
 }

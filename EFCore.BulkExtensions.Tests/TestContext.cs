@@ -1,10 +1,10 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Metadata;
-using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace EFCore.BulkExtensions.Tests
 {
@@ -36,8 +36,17 @@ namespace EFCore.BulkExtensions.Tests
             modelBuilder.Entity<Info>(e => { e.Property(p => p.ConvertedTime).HasConversion((value) => value.AddDays(1), (value) => value.AddDays(-1)); });
             modelBuilder.Entity<Info>().Property(e => e.InfoType).HasConversion(new EnumToStringConverter<InfoType>());
 
-            modelBuilder.Entity<Document>().Property(p => p.ContentLength).HasComputedColumnSql($"(CONVERT([int], len([{nameof(Document.Content)}])))");
-            
+            modelBuilder.Entity<Person>().HasIndex(a => a.Name).IsUnique(); // In SQLite UpdateByColumn(nonPK) requires it has UniqueIndex
+
+            if (Database.IsSqlServer())
+            {
+                modelBuilder.Entity<Document>().Property(p => p.ContentLength).HasComputedColumnSql($"(CONVERT([int], len([{nameof(Document.Content)}])))");
+            }
+            else if (Database.IsSqlite())
+            {
+                modelBuilder.Entity<Document>().Property(p => p.VersionChange).ValueGeneratedOnAddOrUpdate().IsConcurrencyToken().HasDefaultValueSql("CURRENT_TIMESTAMP");
+            }
+
             // [Timestamp] alternative:
             //modelBuilder.Entity<Document>().Property(x => x.RowVersion).HasColumnType("timestamp").ValueGeneratedOnAddOrUpdate().HasConversion(new NumberToBytesConverter<ulong>()).IsConcurrencyToken();
 
@@ -47,13 +56,33 @@ namespace EFCore.BulkExtensions.Tests
 
     public static class ContextUtil
     {
+        public static DbServer DbServer { get; set; }
+
         public static DbContextOptions GetOptions()
         {
-            var builder = new DbContextOptionsBuilder<TestContext>();
             var databaseName = nameof(EFCoreBulkTest);
-            var connectionString = $"Server=localhost;Database={databaseName};Trusted_Connection=True;MultipleActiveResultSets=true";
-            builder.UseSqlServer(connectionString); // Can NOT Test with UseInMemoryDb (Exception: Relational-specific methods can only be used when the context is using a relational)
-            return builder.Options;
+            var optionsBuilder = new DbContextOptionsBuilder<TestContext>();
+
+            if (DbServer == DbServer.SqlServer)
+            {
+                var connectionString = $"Server=localhost;Database={databaseName};Trusted_Connection=True;MultipleActiveResultSets=true";
+                optionsBuilder.UseSqlServer(connectionString); // Can NOT Test with UseInMemoryDb (Exception: Relational-specific methods can only be used when the context is using a relational)
+            }
+            else if (DbServer == DbServer.Sqlite)
+            {
+                string connectionString = $"Data Source={databaseName}.db";
+                optionsBuilder.UseSqlite(connectionString);
+
+                // ALTERNATIVELY:
+                //string connectionString = (new SqliteConnectionStringBuilder { DataSource = $"{databaseName}Lite.db" }).ToString();
+                //optionsBuilder.UseSqlite(new SqliteConnection(connectionString));
+            }
+            else
+            {
+                throw new NotSupportedException($"Database {DbServer} is not supported. Only SQL Server and SQLite are Currently supported.");
+            }
+
+            return optionsBuilder.Options;
         }
     }
 
@@ -63,9 +92,9 @@ namespace EFCore.BulkExtensions.Tests
         {
             foreach (IMutableEntityType entity in modelBuilder.Model.GetEntityTypes())
             {
-                if (!entity.IsOwned()) // without this exclusion OwnedType would not be by default in Owner Table
+                if (!entity.IsOwned() && entity.BaseType == null) // without this exclusion OwnedType would not be by default in Owner Table
                 {
-                    entity.Relational().TableName = entity.ClrType.Name;
+                    entity.SetTableName(entity.ClrType.Name);
                 }
             }
         }

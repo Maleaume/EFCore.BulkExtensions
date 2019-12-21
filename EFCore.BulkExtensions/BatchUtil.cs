@@ -1,19 +1,24 @@
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
-using System.Linq;
-using System.Linq.Expressions;
-using System.Reflection;
-using System.Text;
+using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Query.Internal;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace EFCore.BulkExtensions
 {
-    static class BatchUtil
+    public static class BatchUtil
     {
+        static readonly int SelectStatementLength = "SELECT".Length;
+
         // In comment are Examples of how SqlQuery is changed for Sql Batch
 
         // SELECT [a].[Column1], [a].[Column2], .../r/n
@@ -23,10 +28,15 @@ namespace EFCore.BulkExtensions
         // DELETE [a]
         // FROM [Table] AS [a]
         // WHERE [a].[Columns] = FilterValues
-        public static string GetSqlDelete<T>(IQueryable<T> query) where T : class
+        public static (string, List<object>) GetSqlDelete<T>(IQueryable<T> query, DbContext context) where T : class
         {
-            (string sql, string tableAlias) = GetBatchSql(query);
-            return $"DELETE [{tableAlias}]{sql}";
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: false);
+
+            innerParameters = ReloadSqlParameters(context, innerParameters.ToList()); // Sqlite requires SqliteParameters
+            tableAlias = (GetDatabaseType(context) == DbServer.SqlServer) ? $"[{tableAlias}]" : tableAlias;
+
+            var resultQuery = $"DELETE {topStatement}{tableAlias}{sql}";
+            return (resultQuery, new List<object>(innerParameters));
         }
 
         // SELECT [a].[Column1], [a].[Column2], .../r/n
@@ -36,12 +46,17 @@ namespace EFCore.BulkExtensions
         // UPDATE [a] SET [UpdateColumns] = N'updateValues'
         // FROM [Table] AS [a]
         // WHERE [a].[Columns] = FilterValues
-        public static (string, List<SqlParameter>) GetSqlUpdate<T>(IQueryable<T> query, DbContext context, T updateValues, List<string> updateColumns) where T : class, new()
+        public static (string, List<object>) GetSqlUpdate<T>(IQueryable<T> query, DbContext context, T updateValues, List<string> updateColumns) where T : class, new()
         {
-            (string sql, string tableAlias) = GetBatchSql(query);
-            var sqlParameters = new List<SqlParameter>();
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
+            var sqlParameters = new List<object>(innerParameters);
+
             string sqlSET = GetSqlSetSegment(context, updateValues, updateColumns, sqlParameters);
-            return ($"UPDATE [{tableAlias}] {sqlSET}{sql}", sqlParameters);
+
+            sqlParameters = ReloadSqlParameters(context, sqlParameters); // Sqlite requires SqliteParameters
+
+            var resultQuery = $"UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} {sqlSET}{sql}";
+            return (resultQuery, sqlParameters);
         }
 
         /// <summary>
@@ -51,28 +66,81 @@ namespace EFCore.BulkExtensions
         /// <param name="query"></param>
         /// <param name="expression"></param>
         /// <returns></returns>
-        public static (string, List<SqlParameter>) GetSqlUpdate<T>(IQueryable<T> query, Expression<Func<T, T>> expression) where T : class
+        public static (string, List<object>) GetSqlUpdate<T>(IQueryable<T> query, DbContext context, Expression<Func<T, T>> expression) where T : class
         {
-            (string sql, string tableAlias) = GetBatchSql(query);
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
             var sqlColumns = new StringBuilder();
-            var sqlParameters = new List<SqlParameter>();
+            var sqlParameters = new List<object>(innerParameters);
             var columnNameValueDict = TableInfo.CreateInstance(GetDbContext(query), new List<T>(), OperationType.Read, new BulkConfig()).PropertyColumnNamesDict;
-            CreateUpdateBody(columnNameValueDict, tableAlias, expression.Body, ref sqlColumns, ref sqlParameters);
-            return ($"UPDATE [{tableAlias}] SET {sqlColumns.ToString()} {sql}", sqlParameters);
+            var dbType = GetDatabaseType(context);
+            CreateUpdateBody(columnNameValueDict, tableAlias, expression.Body, dbType, ref sqlColumns, ref sqlParameters);
+
+            sqlParameters = ReloadSqlParameters(context, sqlParameters); // Sqlite requires SqliteParameters
+            sqlColumns = (GetDatabaseType(context) == DbServer.SqlServer) ? sqlColumns : sqlColumns.Replace($"[{tableAlias}].", "");
+
+            var resultQuery = $"UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} SET {sqlColumns} {sql}";
+            return (resultQuery, sqlParameters);
         }
 
-        public static (string, string) GetBatchSql<T>(IQueryable<T> query) where T : class
+        public static List<object> ReloadSqlParameters(DbContext context, List<object> sqlParameters)
+        {
+            DbServer databaseType = GetDatabaseType(context);
+            if (databaseType == DbServer.Sqlite)
+            {
+                var sqlParametersReloaded = new List<object>();
+                foreach (var parameter in sqlParameters)
+                {
+                    var sqlParameter = (SqlParameter)parameter;
+                    sqlParametersReloaded.Add(new SqliteParameter(sqlParameter.ParameterName, sqlParameter.Value));
+                }
+                return sqlParametersReloaded;
+            }
+            else // for SqlServer return original
+            {
+                return sqlParameters;
+            }
+        }
+
+        public static (string, string, string, string, IEnumerable<object>) GetBatchSql<T>(IQueryable<T> query, DbContext context, bool isUpdate) where T : class
         {
             string sqlQuery = query.ToSql();
-            string tableAlias = sqlQuery.Substring(8, sqlQuery.IndexOf("]") - 8);
+            IEnumerable<object> innerParameters = new List<object>();
+            if (!sqlQuery.Contains(" IN (")) // ToParametrizedSql does not work correctly with Contains that is translated to sql IN command
+            {
+                (sqlQuery, innerParameters) = query.ToParametrizedSql();
+            }
+
+            DbServer databaseType = GetDatabaseType(context);
+            string tableAlias = string.Empty;
+            string tableAliasSufixAs = string.Empty;
+            string topStatement = string.Empty;
+            if (databaseType != DbServer.Sqlite) // when Sqlite and Deleted metod tableAlias is Empty: ""
+            {
+                string escapeSymbolEnd = (databaseType == DbServer.SqlServer) ? "]" : "."; // SqlServer : PostrgeSql;
+                string escapeSymbolStart = (databaseType == DbServer.SqlServer) ? "[" : " "; // SqlServer : PostrgeSql;
+                string tableAliasEnd = sqlQuery.Substring(SelectStatementLength, sqlQuery.IndexOf(escapeSymbolEnd) - SelectStatementLength); // " TOP(10) [table_alias" / " [table_alias" : " table_alias"
+                int tableAliasStartIndex = tableAliasEnd.IndexOf(escapeSymbolStart);
+                tableAlias = tableAliasEnd.Substring(tableAliasStartIndex + escapeSymbolStart.Length); // "table_alias"
+                topStatement = tableAliasEnd.Substring(0, tableAliasStartIndex).TrimStart(); // "TOP(10) " / if TOP not present in query this will be a Substring(0,0) == ""
+            }
+
             int indexFROM = sqlQuery.IndexOf(Environment.NewLine);
             string sql = sqlQuery.Substring(indexFROM, sqlQuery.Length - indexFROM);
-            sql = sql.Contains("{") ? sql.Replace("{", "{{") : sql; // Curly brackets have to escaped:
+            sql = sql.Contains("{") ? sql.Replace("{", "{{") : sql; // Curly brackets have to be escaped:
             sql = sql.Contains("}") ? sql.Replace("}", "}}") : sql; // https://github.com/aspnet/EntityFrameworkCore/issues/8820
-            return (sql, tableAlias);
+
+            if (isUpdate && databaseType == DbServer.Sqlite)
+            {
+                int indexPrefixFROM = sql.IndexOf(Environment.NewLine, 1); // skip NewLine from start of string 
+                tableAlias = sql.Substring(7, indexPrefixFROM - 14); // get name of table: "TableName"
+                sql = sql.Substring(indexPrefixFROM, sql.Length - indexPrefixFROM); // remove segment: FROM "TableName" AS "a"
+                tableAliasSufixAs = " AS " + sql.Substring(8, 3) + " ";
+            }
+
+            return (sql, tableAlias, tableAliasSufixAs, topStatement, innerParameters);
         }
 
-        public static string GetSqlSetSegment<T>(DbContext context, T updateValues, List<string> updateColumns, List<SqlParameter> parameters) where T : class, new()
+        public static string GetSqlSetSegment<T>(DbContext context, T updateValues, List<string> updateColumns, List<object> parameters) where T : class, new()
         {
             var tableInfo = TableInfo.CreateInstance<T>(context, new List<T>(), OperationType.Read, new BulkConfig());
             string sql = string.Empty;
@@ -96,6 +164,11 @@ namespace EFCore.BulkExtensions
                         propertyUpdateValue = propertyUpdateValue != null ? property.GetValue(propertyUpdateValue) : propertyUpdateValue;
                         var lastDefaultValues = lastType.Assembly.CreateInstance(lastType.FullName);
                         propertyDefaultValue = property.GetValue(lastDefaultValues);
+                    }
+
+                    if (tableInfo.ConvertibleProperties.ContainsKey(columnName))
+                    {
+                        propertyUpdateValue = tableInfo.ConvertibleProperties[columnName].ConvertToProvider.Invoke(propertyUpdateValue);
                     }
 
                     bool isDifferentFromDefault = propertyUpdateValue != null && propertyUpdateValue?.ToString() != propertyDefaultValue?.ToString();
@@ -129,7 +202,7 @@ namespace EFCore.BulkExtensions
         /// <param name="expression"></param>
         /// <param name="sqlColumns"></param>
         /// <param name="sqlParameters"></param>
-        public static void CreateUpdateBody(Dictionary<string, string> columnNameValueDict, string tableAlias, Expression expression, ref StringBuilder sqlColumns, ref List<SqlParameter> sqlParameters)
+        public static void CreateUpdateBody(Dictionary<string, string> columnNameValueDict, string tableAlias, Expression expression, DbServer dbType, ref StringBuilder sqlColumns, ref List<object> sqlParameters)
         {
             if (expression is MemberInitExpression memberInitExpression)
             {
@@ -144,7 +217,7 @@ namespace EFCore.BulkExtensions
 
                         sqlColumns.Append(" =");
 
-                        CreateUpdateBody(columnNameValueDict, tableAlias, assignment.Expression, ref sqlColumns, ref sqlParameters);
+                        CreateUpdateBody(columnNameValueDict, tableAlias, assignment.Expression, dbType, ref sqlColumns, ref sqlParameters);
 
                         if (memberInitExpression.Bindings.IndexOf(item) < (memberInitExpression.Bindings.Count - 1))
                             sqlColumns.Append(" ,");
@@ -161,7 +234,7 @@ namespace EFCore.BulkExtensions
             else if (expression is ConstantExpression constantExpression)
             {
                 var parmName = $"param_{sqlParameters.Count}";
-                sqlParameters.Add(new SqlParameter(parmName, constantExpression.Value));
+                sqlParameters.Add(new SqlParameter(parmName, constantExpression.Value ?? DBNull.Value));
                 sqlColumns.Append($" @{parmName}");
             }
             else if (expression is UnaryExpression unaryExpression)
@@ -169,23 +242,23 @@ namespace EFCore.BulkExtensions
                 switch (unaryExpression.NodeType)
                 {
                     case ExpressionType.Convert:
-                        CreateUpdateBody(columnNameValueDict, tableAlias, unaryExpression.Operand, ref sqlColumns, ref sqlParameters);
+                        CreateUpdateBody(columnNameValueDict, tableAlias, unaryExpression.Operand, dbType, ref sqlColumns, ref sqlParameters);
                         break;
                     case ExpressionType.Not:
                         sqlColumns.Append(" ~");//this way only for SQL Server 
-                        CreateUpdateBody(columnNameValueDict, tableAlias, unaryExpression.Operand, ref sqlColumns, ref sqlParameters);
+                        CreateUpdateBody(columnNameValueDict, tableAlias, unaryExpression.Operand, dbType, ref sqlColumns, ref sqlParameters);
                         break;
                     default: break;
                 }
             }
             else if (expression is BinaryExpression binaryExpression)
             {
-                CreateUpdateBody(columnNameValueDict, tableAlias, binaryExpression.Left, ref sqlColumns, ref sqlParameters);
+                CreateUpdateBody(columnNameValueDict, tableAlias, binaryExpression.Left, dbType, ref sqlColumns, ref sqlParameters);
 
                 switch (binaryExpression.NodeType)
                 {
                     case ExpressionType.Add:
-                        sqlColumns.Append(" +");
+                        sqlColumns.Append(dbType == DbServer.Sqlite && IsStringConcat(binaryExpression) ? " ||" : " +");
                         break;
                     case ExpressionType.Divide:
                         sqlColumns.Append(" /");
@@ -208,17 +281,16 @@ namespace EFCore.BulkExtensions
                     default: break;
                 }
 
-                CreateUpdateBody(columnNameValueDict, tableAlias, binaryExpression.Right, ref sqlColumns, ref sqlParameters);
+                CreateUpdateBody(columnNameValueDict, tableAlias, binaryExpression.Right, dbType, ref sqlColumns, ref sqlParameters);
             }
             else
             {
                 var value = Expression.Lambda(expression).Compile().DynamicInvoke();
                 var parmName = $"param_{sqlParameters.Count}";
-                sqlParameters.Add(new SqlParameter(parmName, value));
+                sqlParameters.Add(new SqlParameter(parmName, value ?? DBNull.Value));
                 sqlColumns.Append($" @{parmName}");
             }
         }
-
 
         public static DbContext GetDbContext(IQueryable query)
         {
@@ -226,12 +298,32 @@ namespace EFCore.BulkExtensions
             var queryCompiler = typeof(EntityQueryProvider).GetField("_queryCompiler", bindingFlags).GetValue(query.Provider);
             var queryContextFactory = queryCompiler.GetType().GetField("_queryContextFactory", bindingFlags).GetValue(queryCompiler);
 
-            var dependencies = typeof(RelationalQueryContextFactory).GetProperty("Dependencies", bindingFlags).GetValue(queryContextFactory);
+            var dependencies = typeof(RelationalQueryContextFactory).GetField("_dependencies", bindingFlags).GetValue(queryContextFactory);
             var queryContextDependencies = typeof(DbContext).Assembly.GetType(typeof(QueryContextDependencies).FullName);
             var stateManagerProperty = queryContextDependencies.GetProperty("StateManager", bindingFlags | BindingFlags.Public).GetValue(dependencies);
             var stateManager = (IStateManager)stateManagerProperty;
 
             return stateManager.Context;
+        }
+
+        public static DbServer GetDatabaseType(DbContext context)
+        {
+            return context.Database.ProviderName.EndsWith(DbServer.Sqlite.ToString()) ? DbServer.Sqlite : DbServer.SqlServer;
+        }
+
+        internal static bool IsStringConcat(BinaryExpression binaryExpression)
+        {
+            var methodProperty = binaryExpression.GetType().GetProperty("Method");
+            if (methodProperty == null)
+            {
+                return false;
+            }
+            var method = methodProperty.GetValue(binaryExpression) as MethodInfo;
+            if (method == null)
+            {
+                return false;
+            }
+            return method.DeclaringType == typeof(string) && method.Name == nameof(string.Concat);
         }
     }
 }

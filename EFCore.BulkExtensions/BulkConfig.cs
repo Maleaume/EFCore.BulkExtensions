@@ -1,7 +1,8 @@
-﻿using System;
+﻿using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
+using System;
 using System.Collections.Generic;
 using System.Data.Common;
-using System.Data.SqlClient;
 
 namespace EFCore.BulkExtensions
 {
@@ -38,10 +39,13 @@ namespace EFCore.BulkExtensions
 
         public SqlBulkCopyOptions SqlBulkCopyOptions { get; set; }
 
+        public SqliteConnection SqliteConnection { get; set; }
+        public SqliteTransaction SqliteTransaction { get; set; }
+
         public Func<DbConnection, DbConnection> UnderlyingConnection { get; set; }
         public Func<DbTransaction, DbTransaction> UnderlyingTransaction { get; set; }
 
-        protected bool HasOutput { get; set; }
+        internal OperationType OperationType { get; set; }
     }
 
     public class StatsInfo

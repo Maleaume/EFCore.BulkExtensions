@@ -1,6 +1,6 @@
-﻿using System;
+﻿using Microsoft.Data.SqlClient;
+using System;
 using System.Collections.Generic;
-using System.Data.SqlClient;
 using System.Linq;
 
 namespace EFCore.BulkExtensions
@@ -51,8 +51,8 @@ namespace EFCore.BulkExtensions
         public static string SelectIdentityColumnName(string tableName, string schemaName)
         {
             var q = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS " +
-                $"WHERE COLUMNPROPERTY(object_id(TABLE_SCHEMA+'.'+TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1 " +
-                    $"and TABLE_NAME = '{tableName}' and TABLE_SCHEMA = '{schemaName}'";
+                    $"WHERE COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1 " +
+                    $"AND TABLE_NAME = '{tableName}' AND TABLE_SCHEMA = '{schemaName}'";
             return q;
         }
 
@@ -138,13 +138,33 @@ namespace EFCore.BulkExtensions
             return q;
         }
 
+        public static string TruncateTable(string tableName)
+        {
+            var q = $"TRUNCATE TABLE {tableName};";
+            return q;
+        }
+
+
+        /// <summary>
+        /// Used for Sqlite, Truncate table 
+        /// </summary>
+        public static string DeleteTable(string tableName)
+        {
+            var q = $"DELETE FROM {tableName};" +
+                    $"VACUUM;";
+            return q;
+        }
+
         public static string GetCommaSeparatedColumns(List<string> columnsNames, string prefixTable = null, string equalsTable = null)
         {
+            prefixTable += (prefixTable != null && prefixTable != "@") ? "." : "";
+            equalsTable += (equalsTable != null && equalsTable != "@") ? "." : "";
+
             string commaSeparatedColumns = "";
             foreach (var columnName in columnsNames)
             {
-                commaSeparatedColumns += prefixTable != null ? $"{prefixTable}.[{columnName}]" : $"[{columnName}]";
-                commaSeparatedColumns += equalsTable != null ? $" = {equalsTable}.[{columnName}]" : "";
+                commaSeparatedColumns += prefixTable != "" ? $"{prefixTable}[{columnName}]" : $"[{columnName}]";
+                commaSeparatedColumns += equalsTable != "" ? $" = {equalsTable}[{columnName}]" : "";
                 commaSeparatedColumns += ", ";
             }
             if (commaSeparatedColumns != "")
